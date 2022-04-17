@@ -16,7 +16,7 @@ on:
       kernel_version:
         description: "Kernel version: 5.10.100"
         required: false
-        default: "5.15.25_5.10.100"
+        default: "5.15.25_5.4.189"
       kernel_auto:
         description: "Auto use the latest kernel"
         required: false
