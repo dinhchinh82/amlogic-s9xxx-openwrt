@@ -1,0 +1,260 @@
+# JAVIS AI Box / Orange Pi 5B
+# Rebuild using Ophub's OFFICIAL composite action, not a custom rebuild engine.
+# Ubuntu 24.04 Noble ARM64 + Rockchip RK3588 BSP 6.1.157 (first test baseline).
+# This creates an OS BASE image, NOT a pre-validated RKNN/MPP/RGA runtime.
+# Install at: .github/workflows/javis-opi5b-ophub-official-rebuild-v3.yml
+
+name: JAVIS OPi5B - Ophub official rebuild - Noble BSP 6.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'Exact RK3588 BSP 6.1 patch version (e.g. 6.1.157)'
+        required: true
+        default: '6.1.157'
+        type: string
+      publish_release:
+        description: 'Publish a separate JAVIS prerelease (otherwise use Actions artifact)'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write  # Required only to publish to this fork's GitHub Releases.
+
+concurrency:
+  group: javis-opi5b-ophub-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_TAG: Armbian_noble_arm64_server_2026.11
+  SOURCE_ASSET: Armbian_26.11.0-trunk_noble_arm64_6.18.60.img.gz
+  # SHA256 of the upstream Nov-2026 Noble trunk release asset.
+  SOURCE_SHA256: 86113b5b9704f410d5837d0d2b09d747c87c063c5b611e01404bbcdb7fc3b284
+  KERNEL_VERSION: ${{ inputs.kernel_version }}
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  rebuild:
+    name: Rebuild Noble for Orange Pi 5B (RK3588 BSP)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout JAVIS fork (workflow only)
+        uses: actions/checkout@v4
+
+      - name: Validate inputs and install Ophub Ubuntu 24.04 dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$KERNEL_VERSION" =~ ^6\.1\.[0-9]+$ ]] || {
+            echo "::error::kernel_version must match 6.1.N, got '$KERNEL_VERSION'"
+            exit 1
+          }
+          echo "Runner: $(uname -m) / $(. /etc/os-release; echo "$VERSION_CODENAME")"
+          df -h /
+          # Ophub's dependency list for Ubuntu 24.04; fetched from upstream, not old fork.
+          curl -fLSs --retry 4 \
+            https://raw.githubusercontent.com/ophub/amlogic-s9xxx-armbian/main/compile-kernel/tools/script/ubuntu2404-build-armbian-depends \
+            -o "$RUNNER_TEMP/ophub-ubuntu2404-depends.txt"
+          test -s "$RUNNER_TEMP/ophub-ubuntu2404-depends.txt"
+          sudo apt-get update
+          # Shell splitting is intentional here: the official file is a whitespace-separated package list.
+          # shellcheck disable=SC2046
+          sudo apt-get install -y --no-install-recommends $(cat "$RUNNER_TEMP/ophub-ubuntu2404-depends.txt")
+          sudo apt-get clean
+          sudo modprobe loop || true
+          command -v losetup
+          command -v mkfs.ext4
+          command -v pigz
+          df -h /
+
+      - name: Download and verify pinned Ophub Ubuntu Noble trunk image
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sources
+          url="https://github.com/ophub/amlogic-s9xxx-armbian/releases/download/${SOURCE_TAG}/${SOURCE_ASSET}"
+          echo "Source: $url"
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 30 \
+            --output "sources/${SOURCE_ASSET}" "$url"
+          echo "${SOURCE_SHA256}  sources/${SOURCE_ASSET}" | sha256sum -c -
+          gzip -t "sources/${SOURCE_ASSET}"
+          test -s "sources/${SOURCE_ASSET}"
+          ls -lh "sources/${SOURCE_ASSET}"
+          df -h /
+
+      - name: Prepare isolated Orange Pi 5B board override for official Ophub action
+        shell: bash
+        run: |
+          set -euo pipefail
+          cfg="${GITHUB_WORKSPACE}/javis-override/etc/model_database.conf"
+          mkdir -p "$(dirname "$cfg")"
+          curl -fL --retry 4 \
+            https://raw.githubusercontent.com/ophub/amlogic-s9xxx-armbian/main/build-armbian/armbian-files/common-files/etc/model_database.conf \
+            --output "$cfg"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('javis-override/etc/model_database.conf')
+          lines = p.read_text(encoding='utf-8').splitlines(keepends=True)
+          matches = []
+          for i, line in enumerate(lines):
+              if line.lstrip().startswith('#') or ':' not in line:
+                  continue
+              fields = [x.strip() for x in line.rstrip('\r\n').split(':')]
+              if len(fields) == 15 and fields[13] == 'orangepi-5b':
+                  matches.append((i, fields))
+          if len(matches) != 1:
+              raise SystemExit(f'Expected exactly one Orange Pi 5B row, found {len(matches)}')
+          i, f = matches[0]
+          if (f[2], f[3], f[5], f[6], f[9]) != (
+              'rk3588s', 'rk3588s-orangepi-5b.dtb',
+              'u-boot.itb', 'idbloader.img', 'rockchip'
+          ):
+              raise SystemExit(f'Unexpected Orange Pi 5B DTB/bootloader settings: {f}')
+          print('Original kernel tag:', f[8])
+          # Column 9 KERNEL_TAGS selects the BSP release tag 'kernel_rk3588'.
+          f[8] = 'rk3588/6.1.y'
+          lines[i] = ':'.join(f) + '\n'
+          p.write_text(''.join(lines), encoding='utf-8')
+          print('JAVIS board override:', lines[i].rstrip())
+          PY
+          grep ':orangepi-5b:' "$cfg"
+          # This directory is copied by the official composite action into its own
+          # build-armbian/armbian-files/common-files before the official ./rebuild runs.
+
+      - name: Rebuild with Ophub OFFICIAL action (RK3588 BSP, pinned 6.1.x)
+        uses: ophub/amlogic-s9xxx-armbian@main
+        with:
+          build_target: armbian
+          armbian_path: sources/Armbian_26.11.0-trunk_noble_arm64_6.18.60.img.gz
+          armbian_board: orangepi-5b
+          kernel_repo: ophub/kernel
+          kernel_usage: stable
+          armbian_kernel: ${{ inputs.kernel_version }}
+          auto_kernel: 'false'
+          armbian_fstype: ext4
+          armbian_size: '512/8192'
+          armbian_files: javis-override
+          builder_name: JAVIS
+
+      - name: Validate exact Orange Pi 5B output, stage release files and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${PACKAGED_STATUS:-}" == "success" ]] || {
+            echo '::error::Official Ophub action did not signal PACKAGED_STATUS=success'
+            exit 1
+          }
+          out="${PACKAGED_OUTPUTPATH:?PACKAGED_OUTPUTPATH is missing}"
+          test -d "$out"
+          echo "Official Ophub output: $out"
+          ls -lh "$out"
+
+          # Verify the override was actually copied into the ACTION source directory.
+          action_dir="${out%/build/output/images}"
+          effective_cfg="$action_dir/build-armbian/armbian-files/common-files/etc/model_database.conf"
+          test -f "$effective_cfg"
+          python3 - "$effective_cfg" <<'PY'
+          import sys
+          from pathlib import Path
+          rows = []
+          for line in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
+              if line.lstrip().startswith('#'):
+                  continue
+              f = [x.strip() for x in line.split(':')]
+              if len(f) == 15 and f[13] == 'orangepi-5b':
+                  rows.append(f)
+          if len(rows) != 1 or rows[0][8] != 'rk3588/6.1.y':
+              raise SystemExit(f'FATAL: official Action did not use RK3588 BSP override: {rows}')
+          print('Verified action effective board tag:', rows[0][8])
+          PY
+
+          # The official action keeps the original *-trunk_*.img.gz alongside outputs;
+          # NEVER publish that image as a JAVIS Orange Pi 5B build.
+          mapfile -d '' files < <(find "$out" -maxdepth 1 -type f \
+            -name "Armbian_*_rockchip_orangepi-5b_noble_${KERNEL_VERSION}_server_*.img.gz" -print0)
+          if [[ "${#files[@]}" -ne 1 ]]; then
+            echo "::error::Expected one patched Noble/RK3588 image; got ${#files[@]}"
+            find "$out" -maxdepth 1 -type f -printf '%f\n'
+            exit 1
+          fi
+          img="${files[0]}"
+          gzip -t "$img"
+          test "$(stat -c%s "$img")" -gt 50000000
+          echo "Verified generated image: $(basename "$img")"
+
+          stage="${GITHUB_WORKSPACE}/javis-release"
+          mkdir -p "$stage"
+          cp -v "$img" "$stage/"
+          (
+            cd "$stage"
+            sha256sum "$(basename "$img")" > SHA256SUMS.txt
+          )
+          {
+            echo 'Product: JAVIS AI Box OS Base'
+            echo 'Board: orangepi-5b (RK3588S)'
+            echo 'Distribution: Ubuntu 24.04 Noble ARM64'
+            echo "Target BSP kernel: ${KERNEL_VERSION} from ophub/kernel_rk3588"
+            echo 'Method: Ophub official composite Rebuild Action'
+            echo 'Ophub Action ref: ophub/amlogic-s9xxx-armbian@main'
+            echo "GitHub fork commit: ${GITHUB_SHA}"
+            echo "Source release: ${SOURCE_TAG}"
+            echo "Source asset: ${SOURCE_ASSET}"
+            echo "Source SHA256: ${SOURCE_SHA256}"
+            echo "Build UTC: $(date -u +%FT%TZ)"
+            echo 'Status: build artifact only; boot/RKNN/MPP/RGA not yet validated.'
+          } > "$stage/BUILD-MANIFEST.txt"
+          cat "$stage/SHA256SUMS.txt"
+          ls -lh "$stage"
+          echo "### JAVIS OS image ready" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Board: Orange Pi 5B / RK3588S" >> "$GITHUB_STEP_SUMMARY"
+          echo "- OS: Ubuntu 24.04 Noble" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Kernel: ${KERNEL_VERSION} (kernel_rk3588)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: $(basename "$img")" >> "$GITHUB_STEP_SUMMARY"
+          echo '- Status: untested on physical hardware' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish only validated JAVIS image as a separate prerelease
+        if: ${{ inputs.publish_release }}
+        uses: ophub/upload-to-releases@main
+        with:
+          tag: JAVIS-OPi5B-Noble-BSP61-${{ inputs.kernel_version }}-run${{ github.run_id }}-a${{ github.run_attempt }}
+          name: JAVIS Orange Pi 5B Ubuntu 24.04 BSP ${{ inputs.kernel_version }} - test
+          artifacts: ${{ github.workspace }}/javis-release/*
+          allow_updates: 'false'
+          remove_artifacts: 'false'
+          replaces_artifacts: 'false'
+          make_latest: 'false'
+          prerelease: 'true'
+          draft: 'false'
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            JAVIS AI Box OS Base for Orange Pi 5B (RK3588S).
+            Ubuntu 24.04 Noble, Rockchip BSP 6.1.x.
+            Rebuilt by the official Ophub composite Action with a board-specific override.
+            **NOT YET validated for boot, RKNN inference, MPP or RGA.**
+            Flash to a spare microSD and test before installing to eMMC.
+
+      - name: Upload Actions artifact when GitHub Release is disabled
+        if: ${{ !inputs.publish_release }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: JAVIS-OPi5B-Noble-BSP61-${{ inputs.kernel_version }}
+          path: javis-release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Diagnostic info if build fails
+        if: failure()
+        shell: bash
+        run: |
+          echo '=== Free disk ==='
+          df -h || true
+          echo '=== Build input ==='
+          ls -lah sources/ javis-override/etc/ javis-release/ 2>/dev/null || true
+          echo '=== Ophub action output (if any) ==='
+          find /home/runner/work/_actions/ophub/amlogic-s9xxx-armbian -path '*/build/output/images/*' \
+            -maxdepth 10 -type f -printf '%p\n' 2>/dev/null | tail -30 || true
