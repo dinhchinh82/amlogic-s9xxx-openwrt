@@ -1,0 +1,146 @@
+name: JAVIS Orange Pi 5B - Ubuntu 24.04 BSP 6.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'Ophub kernel_rk3588 BSP 6.1 version'
+        required: true
+        default: '6.1.157'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - name: Checkout this fork
+        uses: actions/checkout@v4
+
+      - name: Validate kernel version and board config
+        env:
+          KERNEL_VERSION: ${{ inputs.kernel_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$KERNEL_VERSION" =~ ^6\.1\.[0-9]+$ ]] || {
+            echo "ERROR: Kernel must match 6.1.N" >&2
+            exit 1
+          }
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('build-armbian/armbian-files/common-files/etc/model_database.conf')
+          lines = p.read_text().splitlines(keepends=True)
+          matches = [i for i, line in enumerate(lines)
+                     if not line.lstrip().startswith('#')
+                     and ':orangepi-5b' in line]
+          assert len(matches) == 1, 'Expected exactly one Orange Pi 5B row (update fork first)'
+          i = matches[0]
+          fields = lines[i].rstrip('\n').split(':')
+          assert len(fields) == 15 and fields[13].strip() == 'orangepi-5b', 'Unexpected model database format'
+          assert fields[3].strip() == 'rk3588s-orangepi-5b.dtb', 'Wrong DTB!'
+          fields[8] = 'rk3588/6.1.y'.ljust(len(fields[8]))
+          lines[i] = ':'.join(fields) + '\n'
+          p.write_text(''.join(lines))
+          print('Selected config:', lines[i].strip())
+          PY
+          grep ':orangepi-5b' build-armbian/armbian-files/common-files/etc/model_database.conf
+
+      - name: Free space and install Ophub build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl git jq ca-certificates gzip pigz xz-utils tar file rsync unzip \
+            parted fdisk gdisk dosfstools e2fsprogs btrfs-progs xfsprogs \
+            kmod u-boot-tools device-tree-compiler uuid-runtime \
+            binutils coreutils util-linux bsdextrautils gawk pv wget lz4 zstd
+          sudo apt-get clean
+          df -h /
+
+      - name: Download pinned Ubuntu 24.04 ARM64 trunk image from Ophub
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/output/images
+          release_json="$(curl -fsSL --retry 3 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            'https://api.github.com/repos/ophub/amlogic-s9xxx-armbian/releases/tags/Armbian_noble_arm64_server_2026.11')"
+          source_url="$(jq -r '
+            [.assets[] | select(.name | test("^Armbian_.*-trunk_noble_arm64_.*\\.img\\.gz$"))]
+            | .[0].browser_download_url // empty' <<<"${release_json}")"
+          [[ -n "$source_url" ]] || { echo 'Noble trunk image asset not found'; exit 1; }
+          compressed="build/output/images/$(basename "$source_url")"
+          echo "Downloading: $source_url"
+          curl -fL --retry 4 --retry-delay 5 "$source_url" -o "$compressed"
+          gzip -t "$compressed"
+          gzip -dk "$compressed"
+          echo 'Source image ready:'
+          ls -lh build/output/images/
+          df -h /
+
+      - name: Validate BSP kernel release asset exists
+        shell: bash
+        env:
+          KERNEL_VERSION: ${{ inputs.kernel_version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            'https://api.github.com/repos/ophub/kernel/releases/tags/kernel_rk3588' \
+            | jq -e --arg filename "${KERNEL_VERSION}.tar.gz" \
+              'any(.assets[]; .name == $filename)' >/dev/null \
+            || { echo "Missing ${KERNEL_VERSION}.tar.gz in kernel_rk3588"; exit 1; }
+
+      - name: Rebuild Orange Pi 5B with Rockchip BSP kernel
+        shell: bash
+        env:
+          KERNEL_VERSION: ${{ inputs.kernel_version }}
+        run: |
+          set -euo pipefail
+          sudo ./rebuild \
+            -b orangepi-5b \
+            -r ophub/kernel \
+            -k "$KERNEL_VERSION" \
+            -a false \
+            -t ext4 \
+            -s 512/4096 \
+            -n JAVIS
+
+      - name: Verify output image and save checksums
+        shell: bash
+        env:
+          KERNEL_VERSION: ${{ inputs.kernel_version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          outputs=(build/output/images/Armbian_*_rockchip_orangepi-5b_noble_${KERNEL_VERSION}_server_*.img.gz)
+          ((${#outputs[@]} == 1)) || {
+            echo "Expected 1 Noble/OrangePi5B/BSP output; found ${#outputs[@]}" >&2
+            ls -lh build/output/images/
+            exit 1
+          }
+          gzip -t "${outputs[0]}"
+          sha256sum "${outputs[0]}" > build/output/images/JAVIS_OPi5B_Noble_BSP61.sha256
+          cat build/output/images/JAVIS_OPi5B_Noble_BSP61.sha256
+          ls -lh "${outputs[0]}"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JAVIS-OPi5B-Noble-BSP61-${{ inputs.kernel_version }}
+          path: |
+            build/output/images/Armbian_*_rockchip_orangepi-5b_noble_${{ inputs.kernel_version }}_server_*.img.gz
+            build/output/images/JAVIS_OPi5B_Noble_BSP61.sha256
+          if-no-files-found: error
+          retention-days: 7
