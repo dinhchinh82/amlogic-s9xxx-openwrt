@@ -1,14 +1,15 @@
-# JAVIS AI Box - Minimal patch of Ophub's official-image rebuild workflow.
+# JAVIS AI Box - V4.1 fixes Ophub kernel release family and override path.
 # Upstream reference:
 # https://github.com/ophub/amlogic-s9xxx-armbian/blob/main/.github/workflows/build-armbian-using-official-image.yml
 #
 # Scope: Orange Pi 5B / Ubuntu 24.04 Noble / Rockchip RK3588 BSP 6.1.157.
 # Keeps Ophub's ARM64 runner, dependency setup, /builder virtual disk,
 # composite rebuild action, and GitHub Releases uploader.
-# Adds only the board-kernel override and release verification/isolation.
+# Patches the already-downloaded Ophub action database IN PLACE before rebuild.
+# This avoids an upstream relative-path bug in the armbian_files copy step.
 # WARNING: This is an OS BASE image; RKNN, MPP, RGA, and physical boot are NOT tested here.
 
-name: JAVIS OPi5B V4 - Ophub Noble RK3588 BSP 6.1
+name: JAVIS OPi5B V4.1 - Ophub Noble RK3588 BSP 6.1
 
 on:
   workflow_dispatch:
@@ -23,7 +24,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: javis-opi5b-v4-${{ github.ref }}
+  group: javis-opi5b-v41-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -107,46 +108,79 @@ jobs:
           echo "status=success" >> "${GITHUB_OUTPUT}"
           df -Th
 
-      # JAVIS PATCH 1: override only the Orange Pi 5B kernel tag. The official
-      # Ophub composite action copies this directory before calling ./rebuild.
-      - name: Prepare minimal Orange Pi 5B RK3588 BSP override
+      # Fix for V4: The official Ophub composite action tries to copy
+      # armbian_files while in build/output/images and uses a relative destination.
+      # This can silently fail (|| true). Instead patch the action's downloaded
+      # model_database.conf directly before the official action invokes ./rebuild.
+      # This modifies ONLY the job's temporary action cache, never the repo/fork.
+      - name: Patch effective Ophub Orange Pi 5B board kernel tag IN PLACE
+        id: patch_board
         shell: bash
         run: |
           set -euo pipefail
-          CFG="${GITHUB_WORKSPACE}/javis-override/etc/model_database.conf"
-          mkdir -p "$(dirname "${CFG}")"
-          curl -fL --retry 4 --connect-timeout 20 \
-            https://raw.githubusercontent.com/ophub/amlogic-s9xxx-armbian/main/build-armbian/armbian-files/common-files/etc/model_database.conf \
-            --output "${CFG}"
-          python3 - <<'PY'
+          shopt -s nullglob
+          ACTION_FILES=("${RUNNER_WORKSPACE%/*}"/_actions/ophub/amlogic-s9xxx-armbian/*/action.yml)
+          shopt -u nullglob
+          if [[ "${#ACTION_FILES[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one downloaded Ophub Action, found ${#ACTION_FILES[@]}."
+            printf '%s\n' "${ACTION_FILES[@]}"
+            exit 1
+          fi
+          ACTION_DIR="$(dirname "${ACTION_FILES[0]}")"
+          CFG="${ACTION_DIR}/build-armbian/armbian-files/common-files/etc/model_database.conf"
+          [[ -s "$CFG" ]] || { echo "::error::Ophub board database missing: $CFG"; exit 1; }
+          cp -p "$CFG" "${CFG}.javis-original"
+          export CFG
+          python3 - <<'PYBOARD'
+          import os
           from pathlib import Path
-          path = Path('javis-override/etc/model_database.conf')
-          lines = path.read_text(encoding='utf-8').splitlines()
+          p = Path(os.environ['CFG'])
+          lines = p.read_text(encoding='utf-8').splitlines()
           found = 0
           for i, line in enumerate(lines):
               if not line.strip() or line.lstrip().startswith('#'):
                   continue
-              fields = [field.strip() for field in line.split(':')]
-              if len(fields) == 15 and fields[13] == 'orangepi-5b':
+              fields = line.split(':')
+              if len(fields) == 15 and fields[13].strip() == 'orangepi-5b':
                   found += 1
-                  if (fields[2], fields[3], fields[5], fields[6], fields[9]) != (
-                      'rk3588s', 'rk3588s-orangepi-5b.dtb', 'u-boot.itb',
-                      'idbloader.img', 'rockchip'
-                  ):
-                      raise SystemExit(f'Unexpected Orange Pi 5B DTB/U-Boot fields: {fields}')
+                  fields = [v.strip() for v in fields]
+                  expected = ('rk3588s', 'rk3588s-orangepi-5b.dtb', 'u-boot.itb', 'idbloader.img', 'rockchip')
+                  actual = (fields[2], fields[3], fields[5], fields[6], fields[9])
+                  if actual != expected:
+                      raise SystemExit(f'Unexpected board/bootloader config: {actual}')
                   old = fields[8]
                   if old not in ('stable/6.18.y', 'rk3588/6.1.y'):
-                      raise SystemExit(f'Unexpected kernel family: {old}')
+                      raise SystemExit(f'Unexpected kernel tag; refusing to patch: {old}')
                   fields[8] = 'rk3588/6.1.y'
                   lines[i] = ':'.join(fields)
-                  print(f'Orange Pi 5B: {old} -> {fields[8]}')
+                  print(f'Kernel tag patched: {old} => {fields[8]}')
           if found != 1:
-              raise SystemExit(f'Expected exactly one Orange Pi 5B row, found {found}')
-          path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-          PY
-          grep ':orangepi-5b:' "${CFG}"
+              raise SystemExit(f'Expected one Orange Pi 5B board entry, found {found}')
+          p.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          PYBOARD
+          grep ':orangepi-5b:' "$CFG" | grep -F ':rk3588/6.1.y:'
+          echo "JAVIS_ACTION_DIR=$ACTION_DIR" >> "$GITHUB_ENV"
+          echo 'Kernel board override confirmed inside the Ophub Action source.'
 
-      # Original Ophub composite action; only the inputs are locked for JAVIS.
+      # Fail before the lengthy rebuild if the pinned kernel is not available.
+      - name: Verify kernel_rk3588 release asset is available
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null || { echo '::error::jq is required'; exit 1; }
+          curl --fail --silent --show-error --location --retry 3 \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            'https://api.github.com/repos/ophub/kernel/releases/tags/kernel_rk3588' \
+            | jq -e --arg file "${KERNEL_VERSION}.tar.gz" \
+              '.assets | any(.name == $file)' >/dev/null \
+            || { echo "::error::Kernel ${KERNEL_VERSION}.tar.gz not listed under kernel_rk3588 release"; exit 1; }
+          echo "Kernel URL: https://github.com/ophub/kernel/releases/download/kernel_rk3588/${KERNEL_VERSION}.tar.gz"
+
+      # Keep Ophub's official composite Action unchanged.
+      # kernel_usage=rk3588 is an additional defense; board override is essential.
       - name: Rebuild Armbian using Ophub OFFICIAL Action
         if: ${{ env.ARMBIAN_URL != '' && !cancelled() }}
         uses: ophub/amlogic-s9xxx-armbian@main
@@ -157,9 +191,8 @@ jobs:
           armbian_kernel: '6.1.157'
           auto_kernel: 'false'
           kernel_repo: ophub/kernel
-          kernel_usage: stable
+          kernel_usage: rk3588
           armbian_fstype: ext4
-          armbian_files: javis-override
           builder_name: JAVIS
 
       # JAVIS PATCH 2: verify the effective board database and the exact output.
@@ -243,7 +276,7 @@ jobs:
           echo "JAVIS_SHA256=${SHA}" >> "${GITHUB_ENV}"
           echo "JAVIS_MANIFEST=${MANIFEST}" >> "${GITHUB_ENV}"
           echo "Image: $(basename "${IMG}")"
-          echo '### JAVIS AI Box V4 build' >> "${GITHUB_STEP_SUMMARY}"
+          echo '### JAVIS AI Box V4.1.1 build' >> "${GITHUB_STEP_SUMMARY}"
           echo '- Ubuntu 24.04 Noble / Orange Pi 5B / kernel_rk3588 6.1.157' >> "${GITHUB_STEP_SUMMARY}"
           echo "- Image: $(basename "${IMG}")" >> "${GITHUB_STEP_SUMMARY}"
           echo '- **Boot, RKNN, MPP and RGA not validated on hardware**' >> "${GITHUB_STEP_SUMMARY}"
@@ -294,4 +327,5 @@ jobs:
           echo "PACKAGED_STATUS=${PACKAGED_STATUS:-not-set}"
           echo "PACKAGED_OUTPUTPATH=${PACKAGED_OUTPUTPATH:-not-set}"
           ls -lh "${PACKAGED_OUTPUTPATH:-/builder/build/output/images}" 2>/dev/null || true
-          ls -lh "${GITHUB_WORKSPACE}/javis-override/etc" 2>/dev/null || true
+          echo "Ophub Action dir: ${JAVIS_ACTION_DIR:-unknown}"
+          [[ -n "${JAVIS_ACTION_DIR:-}" ]] && grep ':orangepi-5b:' "${JAVIS_ACTION_DIR}/build-armbian/armbian-files/common-files/etc/model_database.conf" || true
