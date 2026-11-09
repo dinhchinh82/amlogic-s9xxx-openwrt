@@ -1,0 +1,84 @@
+# JAVIS AI Box - Source build with the OFFICIAL Armbian build framework.
+# Target: Orange Pi 5B (RK3588S), Ubuntu 24.04 Noble, Rockchip BSP vendor 6.1.
+# This is NOT an Ophub "rebuild" and does not patch an existing image.
+# References:
+# https://github.com/armbian/build/blob/main/action.yml
+# https://github.com/armbian/build/blob/main/config/boards/orangepi5b.csc
+# https://github.com/armbian/build/blob/main/config/sources/families/rockchip-rk3588.conf
+name: JAVIS - Official Armbian OPi5B Noble Vendor 6.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_variant:
+        description: 'Image type: minimal for AI appliances, server for full CLI tools'
+        type: choice
+        required: true
+        default: minimal
+        options:
+          - minimal
+          - server
+
+permissions:
+  contents: write
+
+concurrency:
+  group: javis-official-opi5b-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Orange Pi 5B | Ubuntu 24.04 | vendor 6.1 | ${{ inputs.image_variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      # Use Armbian's own composite action. It checks out armbian/os and
+      # armbian/build, compiles/builds via compile.sh, then creates a Release.
+      - name: Build OS from official Armbian source
+        uses: armbian/build@main
+        with:
+          armbian_token: ${{ secrets.GITHUB_TOKEN }}
+          armbian_target: build
+          armbian_board: orangepi5b
+          armbian_release: noble
+          armbian_kernel_branch: vendor
+          armbian_ui: ${{ inputs.image_variant }}
+          armbian_runner_clean: 'yes'
+          armbian_compress: 'sha,img,xz'
+          armbian_release_title: 'JAVIS TEST - Armbian Official Orange Pi 5B Ubuntu 24.04 vendor 6.1'
+          armbian_release_body: |
+            Built with the official Armbian build framework, for Orange Pi 5B (RK3588S).
+            Ubuntu Noble 24.04; BRANCH=vendor (Rockchip BSP 6.1); no Ophub rebuild.
+            TEST IMAGE ONLY: verify boot, rknpu, RKNN, MPP, RGA, thermals and long-running AI workloads before production.
+          armbian_release_tag: javis-opi5b-noble-vendor61-${{ inputs.image_variant }}-${{ github.run_number }}
+          armbian_release_prerelease: 'true'
+          # Correct download URLs in the Armbian assets manifest for GitHub Releases.
+          armbian_download_base_url: https://github.com/${{ github.repository }}/releases/download/javis-opi5b-noble-vendor61-${{ inputs.image_variant }}-${{ github.run_number }}
+          armbian_download_repository: '/'
+
+      # Additional read-only checks; the engine and packaging stay unchanged.
+      - name: Verify output filename and record source versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '=== Armbian build framework revision ==='
+          git -C build rev-parse HEAD
+          echo '=== Board configuration ==='
+          grep -E '^(BOARD_NAME|BOARDFAMILY|KERNEL_TARGET|BOOT_FDT_FILE)=' \
+            build/config/boards/orangepi5b.csc
+          echo '=== Vendor kernel source ==='
+          sed -n '/^[[:space:]]*vendor)/,/^[[:space:]]*;;/p' \
+            build/config/sources/families/rockchip-rk3588.conf | \
+            grep -E 'KERNEL_MAJOR_MINOR|KERNELSOURCE|KERNELBRANCH|KERNELPATCHDIR'
+          echo '=== Output files ==='
+          find build/output/images -maxdepth 1 -type f -printf '%f (%s bytes)\n'
+          mapfile -t imgs < <(find build/output/images -maxdepth 1 -type f \
+            -iname '*orangepi5b*noble*vendor*.img.xz' | sort)
+          if (( ${#imgs[@]} != 1 )); then
+            echo "::error::Expected one Orange Pi 5B Noble vendor image; found ${#imgs[@]}"
+            exit 1
+          fi
+          echo "Verified expected image: ${imgs[0]}"
+          xz -t "${imgs[0]}"
+          sha256sum "${imgs[0]}"
+          echo 'NOTE: This is a file/metadata check, NOT an RKNN/NPU hardware validation.'
